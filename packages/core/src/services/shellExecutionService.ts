@@ -8,7 +8,7 @@ import { spawn } from 'child_process';
 import { TextDecoder } from 'util';
 import os from 'os';
 import stripAnsi from 'strip-ansi';
-import { getCachedEncodingForBuffer } from '../utils/systemEncoding.js';
+import { getCachedEncodingForBuffer, detectEncodingFromBuffer } from '../utils/systemEncoding.js';
 import { isBinary } from '../utils/textUtils.js';
 
 const SIGKILL_TIMEOUT_MS = 200;
@@ -89,18 +89,51 @@ export class ShellExecutionService {
     abortSignal: AbortSignal,
   ): ShellExecutionHandle {
     const isWindows = os.platform() === 'win32';
-    const shell = isWindows ? 'cmd.exe' : 'bash';
-    const shellArgs = [isWindows ? '/c' : '-c', commandToExecute];
+    
+    let shell: string;
+    let shellArgs: string[];
+    let spawnOptions: any;
 
-    const child = spawn(shell, shellArgs, {
-      cwd,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      detached: !isWindows, // Use process groups on non-Windows for robust killing
-      env: {
-        ...process.env,
-        LLXPRT_CLI: '1',
-      },
-    });
+    if (isWindows) {
+      // For Windows, use cmd.exe with proper encoding handling
+      shell = 'cmd.exe';
+      
+      // Attempt to set UTF-8 code page before running the command to handle
+      // multi-byte environments better, then run the actual command
+      const encodingCommand = `chcp 65001 >nul 2>&1 & ${commandToExecute}`;
+      shellArgs = ['/c', encodingCommand];
+      
+      spawnOptions = {
+        cwd,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: false, // Don't use detached on Windows for better process control
+        env: {
+          ...process.env,
+          LLXPRT_CLI: '1',
+          // Force UTF-8 code page for better encoding support
+          'PYTHONIOENCODING': 'utf-8',
+        },
+        // On Windows, set the windowsVerbatimArguments to prevent Node.js from 
+        // over-escaping command arguments which can cause the excessive quoting issue
+        windowsVerbatimArguments: false,
+      };
+    } else {
+      // For Unix-like systems, use bash as before
+      shell = 'bash';
+      shellArgs = ['-c', commandToExecute];
+      
+      spawnOptions = {
+        cwd,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: true, // Use process groups on non-Windows for robust killing
+        env: {
+          ...process.env,
+          LLXPRT_CLI: '1',
+        },
+      };
+    }
+
+    const child = spawn(shell, shellArgs, spawnOptions);
 
     const result = new Promise<ShellExecutionResult>((resolve) => {
       // Use decoders to handle multi-byte characters safely (for streaming output).
@@ -119,13 +152,28 @@ export class ShellExecutionService {
 
       const handleOutput = (data: Buffer, stream: 'stdout' | 'stderr') => {
         if (!stdoutDecoder || !stderrDecoder) {
-          const encoding = getCachedEncodingForBuffer(data);
+          let encoding = getCachedEncodingForBuffer(data);
+          
+          // Special handling for Windows multi-byte environments
+          if (os.platform() === 'win32' && (!encoding || encoding === 'utf-8')) {
+            // Try to detect if we're in a multi-byte environment
+            // by checking for common Japanese/Asian encodings
+            const detectedEncoding = detectEncodingFromBuffer(data);
+            if (detectedEncoding && 
+                (detectedEncoding.includes('shift') || 
+                 detectedEncoding.includes('932') ||
+                 detectedEncoding.includes('sjis'))) {
+              encoding = 'shift_jis';
+            }
+          }
+          
           try {
             stdoutDecoder = new TextDecoder(encoding);
             stderrDecoder = new TextDecoder(encoding);
-          } catch {
+          } catch (error) {
             // If the encoding is not supported, fall back to utf-8.
-            // This can happen on some platforms for certain encodings like 'utf-32le'.
+            // This can happen on some platforms for certain encodings.
+            console.warn(`Unsupported encoding '${encoding}', falling back to utf-8:`, error);
             stdoutDecoder = new TextDecoder('utf-8');
             stderrDecoder = new TextDecoder('utf-8');
           }
