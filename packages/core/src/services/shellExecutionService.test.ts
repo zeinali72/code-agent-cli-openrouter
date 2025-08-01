@@ -224,6 +224,7 @@ describe('ShellExecutionService', () => {
               expectedSignal,
             );
           } else {
+            // For Windows, expect taskkill to be called
             expect(mockSpawn).toHaveBeenCalledWith(expectedCommand, [
               '/pid',
               String(mockChildProcess.pid),
@@ -336,9 +337,10 @@ describe('ShellExecutionService', () => {
       mockPlatform.mockReturnValue('win32');
       await simulateExecution('dir', (cp) => cp.emit('exit', 0, null));
 
+      // With our fix, Windows commands are wrapped with chcp to set UTF-8 encoding
       expect(mockSpawn).toHaveBeenCalledWith(
         'cmd.exe',
-        ['/c', 'dir'],
+        ['/c', 'chcp 65001 >nul 2>&1 & dir'],
         expect.objectContaining({ detached: false }),
       );
     });
